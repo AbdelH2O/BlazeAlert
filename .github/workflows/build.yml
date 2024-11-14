@@ -18,23 +18,48 @@ jobs:
       with:
         submodules: 'recursive'
 
+    - name: Cache ESP-IDF installation
+      id: esp-idf-cache
+      uses: actions/cache@v3
+      with:
+        path: /opt/esp/idf
+        key: esp-idf-v5.1
+        restore-keys: |
+          esp-idf-
+
+    - name: Set up ESP-IDF
+      if: steps.esp-idf-cache.outputs.cache-hit != 'true'
+      run: |
+        # Download and set up ESP-IDF v5.1 only if not cached
+        git clone -b v5.1 --recursive https://github.com/espressif/esp-idf.git /opt/esp/idf
+        /opt/esp/idf/install.sh
+
+    - name: Cache Python packages
+      uses: actions/cache@v3
+      with:
+        path: ~/.cache/pip
+        key: python-packages-${{ runner.os }}-${{ hashFiles('/opt/esp/idf/requirements.txt') }}
+        restore-keys: |
+          python-packages-${{ runner.os }}-
+
+    - name: Update idf-component-manager
+      run: |
+        source /opt/esp/idf/export.sh
+        python3 -m pip install --upgrade idf-component-manager
+
     - name: Install Arduino core for ESP32
       run: |
         mkdir -p esp32/components
         cd esp32/components
         git clone https://github.com/espressif/arduino-esp32.git arduino
 
-    - name: Set up ESP-IDF
-      run: |
-        # Download and set up ESP-IDF v5.0
-        git clone -b v5.0 --recursive https://github.com/espressif/esp-idf.git /opt/esp/idf
-        # Run the install script to set up the environment
-        /opt/esp/idf/install.sh
-
-    - name: Update idf-component-manager
-      run: |
-        source /opt/esp/idf/export.sh
-        python3 -m pip install --upgrade idf-component-manager
+    - name: Cache build output
+      uses: actions/cache@v3
+      with:
+        path: esp32/build
+        key: build-${{ github.sha }}
+        restore-keys: |
+          build-
 
     - name: esp-idf build
       run: |
