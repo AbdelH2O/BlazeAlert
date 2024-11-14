@@ -28,11 +28,11 @@ jobs:
       run: |
         # Download and set up ESP-IDF v5.0
         git clone -b v5.0 --recursive https://github.com/espressif/esp-idf.git /opt/esp/idf
-        python3 -m pip install -r /opt/esp/idf/requirements.txt
+        # Run the install script to set up the environment
+        /opt/esp/idf/install.sh
 
     - name: Update idf-component-manager
       run: |
-        /opt/esp/idf/install.sh
         source /opt/esp/idf/export.sh
         python3 -m pip install --upgrade idf-component-manager
 
