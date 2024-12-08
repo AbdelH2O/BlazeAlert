@@ -8,8 +8,8 @@ const DevicePage = () => {
       <aside className="w-1/5 bg-gray-800 text-white flex flex-col p-4">
         <div className="text-2xl font-bold mb-6">BlazeAlert</div>
         <nav className="flex flex-col gap-6">
-          <a href="/device" className="text-gray-300 hover:text-white text-lg">Device</a>
-          <a href="/latest" className="text-gray-300 hover:text-white text-lg">Latest</a>
+          <a href="/list" className="text-gray-300 hover:text-white text-lg">Device List</a>
+          <a href="/map" className="text-gray-300 hover:text-white text-lg">Map</a>
           <a href="/statistics" className="text-gray-300 hover:text-white text-lg">Statistics</a>
         </nav>
       </aside>
