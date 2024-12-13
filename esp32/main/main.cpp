@@ -1,168 +1,137 @@
+#include "esp_wifi.h"
+#include "esp_system.h"
+#include "esp_log.h"
+#include "esp_http_server.h"
+#include "esp_ota_ops.h"
+#include "nvs_flash.h"
 
-#include <WiFi.h>
-#include <WiFiClient.h>
-#include <WebServer.h>
-#include <ESPmDNS.h>
-#include <Update.h>
+// Network credentials
+#define STA_SSID      "YourNetworkSSID"
+#define STA_PASSWORD  "YourNetworkPassword"
+#define AP_SSID       "ESP32-AccessPoint"
+#define AP_PASSWORD   "12345678"
 
-const char* host = "esp32";
-const char* ssid = "REPLACE_WITH_YOUR_SSID";
-const char* password = "REPLACE_WITH_YOUR_PASSWORD";
+// OTA update endpoint
+#define OTA_URL       "/update"
 
-WebServer server(80);
+static const char *TAG = "OTA Example";
 
-/*
- * Login page
- */
-const char* loginIndex = 
- "<form name='loginForm'>"
-    "<table width='20%' bgcolor='A09F9F' align='center'>"
-        "<tr>"
-            "<td colspan=2>"
-                "<center><font size=4><b>ESP32 Login Page</b></font></center>"
-                "<br>"
-            "</td>"
-            "<br>"
-            "<br>"
-        "</tr>"
-        "<td>Username:</td>"
-        "<td><input type='text' size=25 name='userid'><br></td>"
-        "</tr>"
-        "<br>"
-        "<br>"
-        "<tr>"
-            "<td>Password:</td>"
-            "<td><input type='Password' size=25 name='pwd'><br></td>"
-            "<br>"
-            "<br>"
-        "</tr>"
-        "<tr>"
-            "<td><input type='submit' onclick='check(this.form)' value='Login'></td>"
-        "</tr>"
-    "</table>"
-"</form>"
-"<script>"
-    "function check(form)"
-    "{"
-    "if(form.userid.value=='admin' && form.pwd.value=='admin')"
-    "{"
-    "window.open('/serverIndex')"
-    "}"
-    "else"
-    "{"
-    " alert('Error Password or Username')/*displays error message*/"
-    "}"
-    "}"
-"</script>";
- 
-/*
- * Server Index Page
- */
- 
-const char* serverIndex = 
-"<script src='https://ajax.googleapis.com/ajax/libs/jquery/3.2.1/jquery.min.js'></script>"
-"<form method='POST' action='#' enctype='multipart/form-data' id='upload_form'>"
-   "<input type='file' name='update'>"
-        "<input type='submit' value='Update'>"
-    "</form>"
- "<div id='prg'>progress: 0%</div>"
- "<script>"
-  "$('form').submit(function(e){"
-  "e.preventDefault();"
-  "var form = $('#upload_form')[0];"
-  "var data = new FormData(form);"
-  " $.ajax({"
-  "url: '/update',"
-  "type: 'POST',"
-  "data: data,"
-  "contentType: false,"
-  "processData:false,"
-  "xhr: function() {"
-  "var xhr = new window.XMLHttpRequest();"
-  "xhr.upload.addEventListener('progress', function(evt) {"
-  "if (evt.lengthComputable) {"
-  "var per = evt.loaded / evt.total;"
-  "$('#prg').html('progress: ' + Math.round(per*100) + '%');"
-  "}"
-  "}, false);"
-  "return xhr;"
-  "},"
-  "success:function(d, s) {"
-  "console.log('success!')" 
- "},"
- "error: function (a, b, c) {"
- "}"
- "});"
- "});"
- "</script>";
+// HTTP Server URI Handler for the update endpoint
+esp_err_t ota_handler(httpd_req_t *req)
+{
+    ESP_LOGI(TAG, "Handling OTA update");
 
-/*
- * setup function
- */
-void setup(void) {
-  Serial.begin(115200);
-
-  // Connect to WiFi network
-  WiFi.begin(ssid, password);
-  Serial.println("");
-
-  // Wait for connection
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-  Serial.println("");
-  Serial.print("Connected to ");
-  Serial.println(ssid);
-  Serial.print("IP address: ");
-  Serial.println(WiFi.localIP());
-
-  /*use mdns for host name resolution*/
-  if (!MDNS.begin(host)) { //http://esp32.local
-    Serial.println("Error setting up MDNS responder!");
-    while (1) {
-      delay(1000);
+    // Prepare for OTA update
+    esp_ota_handle_t update_handle = 0;
+    esp_err_t err = esp_ota_begin(update_handle, ESP_SIZE_UNKNOWN, &update_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_ota_begin failed! %s", esp_err_to_name(err));
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
     }
-  }
-  Serial.println("mDNS responder started");
-  /*return index page which is stored in serverIndex */
-  server.on("/", HTTP_GET, []() {
-    server.sendHeader("Connection", "close");
-    server.send(200, "text/html", loginIndex);
-  });
-  server.on("/serverIndex", HTTP_GET, []() {
-    server.sendHeader("Connection", "close");
-    server.send(200, "text/html", serverIndex);
-  });
-  /*handling uploading firmware file */
-  server.on("/update", HTTP_POST, []() {
-    server.sendHeader("Connection", "close");
-    server.send(200, "text/plain", (Update.hasError()) ? "FAIL" : "OK");
-    ESP.restart();
-  }, []() {
-    HTTPUpload& upload = server.upload();
-    if (upload.status == UPLOAD_FILE_START) {
-      Serial.printf("Update: %s\n", upload.filename.c_str());
-      if (!Update.begin(UPDATE_SIZE_UNKNOWN)) { //start with max available size
-        Update.printError(Serial);
-      }
-    } else if (upload.status == UPLOAD_FILE_WRITE) {
-      /* flashing firmware to ESP*/
-      if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
-        Update.printError(Serial);
-      }
-    } else if (upload.status == UPLOAD_FILE_END) {
-      if (Update.end(true)) { //true to set the size to the current progress
-        Serial.printf("Update Success: %u\nRebooting...\n", upload.totalSize);
-      } else {
-        Update.printError(Serial);
-      }
+
+    // Write incoming OTA data to flash
+    size_t received_data_size = 0;
+    char data[1024];
+    while (received_data_size < req->content_len) {
+        int data_len = httpd_req_recv(req, data, sizeof(data));
+        if (data_len <= 0) {
+            ESP_LOGE(TAG, "Failed to read data!");
+            httpd_resp_send_500(req);
+            return ESP_FAIL;
+        }
+
+        // Write data to OTA partition
+        err = esp_ota_write(update_handle, data, data_len);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "OTA write failed! %s", esp_err_to_name(err));
+            httpd_resp_send_500(req);
+            return ESP_FAIL;
+        }
+        received_data_size += data_len;
     }
-  });
-  server.begin();
+
+    // End the OTA process
+    err = esp_ota_end(update_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "OTA end failed! %s", esp_err_to_name(err));
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+
+    // Reboot to apply the update
+    esp_restart();
+
+    return ESP_OK;
 }
 
-void loop(void) {
-  server.handleClient();
-  delay(1);
+// Function to start the HTTP server
+esp_err_t start_http_server(void)
+{
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    httpd_handle_t server = NULL;
+
+    // Start the HTTP server
+    esp_err_t res = httpd_start(&server, &config);
+    if (res == ESP_OK) {
+        httpd_uri_t ota_uri = {
+            .uri       = OTA_URL,
+            .method    = HTTP_POST,
+            .handler   = ota_handler,
+            .user_ctx  = NULL
+        };
+        httpd_register_uri_handler(server, &ota_uri);
+    } else {
+        ESP_LOGE(TAG, "Failed to start HTTP server");
+    }
+    return res;
+}
+
+// Function to start the Wi-Fi Station and Access Point
+void wifi_init(void)
+{
+    // Initialize NVS
+    ESP_ERROR_CHECK(nvs_flash_init());
+
+    // Configure Station (STA) mode
+    wifi_config_t wifi_sta_config = {
+        .sta = {
+            .ssid = STA_SSID,
+            .password = STA_PASSWORD
+        }
+    };
+
+    // Initialize Wi-Fi
+    ESP_ERROR_CHECK(esp_wifi_init(NULL));
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(ESP_IF_WIFI_STA, &wifi_sta_config));
+    ESP_ERROR_CHECK(esp_wifi_start());
+
+    // Start Access Point (AP) mode
+    wifi_config_t wifi_ap_config = {
+        .ap = {
+            .ssid = AP_SSID,
+            .password = AP_PASSWORD,
+            .ssid_len = 0,
+            .channel = 1,
+            .authmode = WIFI_AUTH_WPA2_PSK,
+            .max_connection = 4,
+            .beacon_interval = 100
+        }
+    };
+    ESP_ERROR_CHECK(esp_wifi_set_config(ESP_IF_WIFI_AP, &wifi_ap_config));
+    ESP_ERROR_CHECK(esp_wifi_start());
+}
+
+void app_main(void)
+{
+    ESP_LOGI(TAG, "Starting OTA update server");
+
+    // Initialize Wi-Fi (STA and AP mode)
+    wifi_init();
+
+    // Start the HTTP server for handling OTA
+    start_http_server();
+
+    ESP_LOGI(TAG, "Server running");
 }
