@@ -1,13 +1,13 @@
-import { Fragment, use, useEffect, useState } from 'react'
+import { Fragment, useEffect, useState } from 'react'
 import { Dialog, Menu, Transition } from '@headlessui/react'
 import {
 	BellIcon,
-	CalendarIcon,
+	// CalendarIcon,
 	ChartBarIcon,
-	FolderIcon,
+	// FolderIcon,
 	HomeIcon,
-	InboxIcon,
-	UsersIcon,
+	// InboxIcon,
+	// UsersIcon,
 	MapIcon,
 	PhoneIcon,
 	XMarkIcon,
