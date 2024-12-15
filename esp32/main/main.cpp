@@ -3,7 +3,7 @@
 #include "esp_log.h"
 #include "nvs_flash.h"
 #include "esp_http_server.h"
-#include "esp_https_ota.h"
+#include "esp_ota_ops.h"
 #include "esp_http_client.h"
 
 // Wi-Fi credentials for Station mode
@@ -11,77 +11,135 @@
 #define STA_PASSWORD  "YourNetworkPassword"
 
 // Access Point credentials
-#define AP_SSID       "ESP32-AccessPoint"
+#define AP_SSID       "Slave-ESP-AP"
 #define AP_PASSWORD   "12345678"
 
 // Log tag
-static const char *TAG = "Dynamic_HTTPS_OTA";
+static const char *TAG = "Slave_ESP";
 
 // HTTP server handle
 httpd_handle_t server = NULL;
 
-// Function to perform OTA update
-esp_err_t perform_ota(const char *ota_url) {
-    ESP_LOGI(TAG, "Starting OTA update from URL: %s", ota_url);
+// List of connected devices (to propagate updates)
+#define MAX_DEVICES 4
+char connected_devices[MAX_DEVICES][16]; // IP addresses of connected ESP devices
+int num_connected_devices = 0;
 
-    esp_http_client_config_t ota_client_config = {
-        .url = ota_url,
-        .cert_pem = NULL, // Add server's root certificate here for secure connections
-    };
+// Function to forward OTA to connected devices
+esp_err_t propagate_update(const char *binary, size_t binary_len) {
+    ESP_LOGI(TAG, "Propagating OTA update to %d connected devices", num_connected_devices);
 
-    esp_err_t ret = esp_https_ota(&ota_client_config);
-    if (ret == ESP_OK) {
-        ESP_LOGI(TAG, "OTA update completed successfully. Restarting...");
-        esp_restart();
-    } else {
-        ESP_LOGE(TAG, "OTA update failed: %s", esp_err_to_name(ret));
-    }
-    return ret;
-}
+    for (int i = 0; i < num_connected_devices; i++) {
+        ESP_LOGI(TAG, "Propagating to device %s", connected_devices[i]);
 
-// HTTP handler for the /update route
-esp_err_t update_handler(httpd_req_t *req) {
-    ESP_LOGI(TAG, "Received OTA update request");
+        char url[64];
+        snprintf(url, sizeof(url), "http://%s/update", connected_devices[i]);
 
-    // Buffer to store the URL passed in the HTTP body
-    char url_buffer[256];
-    int content_len = req->content_len;
+        esp_http_client_config_t config = {
+            .url = url,
+            .method = HTTP_METHOD_POST,
+        };
 
-    // Read the URL from the HTTP POST request body
-    if (content_len >= sizeof(url_buffer)) {
-        ESP_LOGE(TAG, "URL is too long");
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "URL too long");
-        return ESP_FAIL;
-    }
+        esp_http_client_handle_t client = esp_http_client_init(&config);
+        esp_http_client_set_post_field(client, binary, binary_len);
 
-    int received = httpd_req_recv(req, url_buffer, content_len);
-    if (received <= 0) {
-        ESP_LOGE(TAG, "Failed to read URL");
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid request");
-        return ESP_FAIL;
-    }
-    url_buffer[received] = '\0'; // Null-terminate the URL string
+        esp_err_t ret = esp_http_client_perform(client);
+        if (ret == ESP_OK) {
+            ESP_LOGI(TAG, "Update successful for %s", connected_devices[i]);
+        } else {
+            ESP_LOGE(TAG, "Update failed for %s: %s", connected_devices[i], esp_err_to_name(ret));
+        }
 
-    ESP_LOGI(TAG, "OTA URL: %s", url_buffer);
-
-    // Perform OTA update
-    if (perform_ota(url_buffer) == ESP_OK) {
-        httpd_resp_sendstr(req, "OTA update successful. Restarting...");
-    } else {
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OTA update failed");
+        esp_http_client_cleanup(client);
     }
 
     return ESP_OK;
+}
+
+// OTA handler to receive and write the binary file
+esp_err_t update_handler(httpd_req_t *req) {
+    ESP_LOGI(TAG, "Received OTA update request");
+
+    char *binary = malloc(req->content_len);
+    if (!binary) {
+        ESP_LOGE(TAG, "Failed to allocate memory for binary");
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Memory allocation failed");
+        return ESP_FAIL;
+    }
+
+    int received = 0, total_received = 0;
+    while ((received = httpd_req_recv(req, binary + total_received, req->content_len - total_received)) > 0) {
+        total_received += received;
+    }
+
+    if (received < 0) {
+        ESP_LOGE(TAG, "Failed to receive file");
+        free(binary);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "File reception failed");
+        return ESP_FAIL;
+    }
+
+    ESP_LOGI(TAG, "Received %d bytes of OTA binary", total_received);
+
+    // Apply the OTA update
+    const esp_partition_t *update_partition = esp_ota_get_next_update_partition(NULL);
+    esp_ota_handle_t ota_handle;
+
+    esp_err_t ret = esp_ota_begin(update_partition, OTA_SIZE_UNKNOWN, &ota_handle);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "esp_ota_begin failed (%s)", esp_err_to_name(ret));
+        free(binary);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OTA begin failed");
+        return ESP_FAIL;
+    }
+
+    ret = esp_ota_write(ota_handle, binary, total_received);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "esp_ota_write failed (%s)", esp_err_to_name(ret));
+        esp_ota_end(ota_handle);
+        free(binary);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OTA write failed");
+        return ESP_FAIL;
+    }
+
+    esp_ota_end(ota_handle);
+    esp_ota_set_boot_partition(update_partition);
+
+    // Propagate the update to connected devices
+    propagate_update(binary, total_received);
+
+    free(binary);
+    httpd_resp_sendstr(req, "OTA update applied and propagated. Restarting...");
+
+    // Restart to apply the update
+    esp_restart();
+    return ESP_OK;
+}
+
+// Function to discover connected devices
+void discover_connected_devices() {
+    wifi_sta_list_t wifi_sta_list;
+    esp_err_t ret = esp_wifi_ap_get_sta_list(&wifi_sta_list);
+
+    if (ret == ESP_OK) {
+        num_connected_devices = wifi_sta_list.num;
+        for (int i = 0; i < num_connected_devices; i++) {
+            uint8_t *mac = wifi_sta_list.sta[i].mac;
+            snprintf(connected_devices[i], sizeof(connected_devices[i]), "192.168.4.%d", mac[5] + 1); // Example IP generation
+            ESP_LOGI(TAG, "Discovered device: %s", connected_devices[i]);
+        }
+    } else {
+        ESP_LOGE(TAG, "Failed to get station list: %s", esp_err_to_name(ret));
+        num_connected_devices = 0;
+    }
 }
 
 // Function to start the HTTP server
 void start_http_server() {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
 
-    // Start the HTTP server
     ESP_LOGI(TAG, "Starting HTTP server");
     if (httpd_start(&server, &config) == ESP_OK) {
-        // Register the /update URI handler
         httpd_uri_t update_uri = {
             .uri       = "/update",
             .method    = HTTP_POST,
@@ -95,7 +153,7 @@ void start_http_server() {
     }
 }
 
-// Initialize Wi-Fi in SoftAP + Station mode
+// Initialize Wi-Fi in AP+STA mode
 void wifi_init(void) {
     ESP_ERROR_CHECK(nvs_flash_init());
     ESP_ERROR_CHECK(esp_netif_init());
@@ -107,7 +165,6 @@ void wifi_init(void) {
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
 
-    // Configure and start Station mode
     wifi_config_t wifi_sta_config = {
         .sta = {
             .ssid = STA_SSID,
@@ -116,14 +173,13 @@ void wifi_init(void) {
     };
     ESP_ERROR_CHECK(esp_wifi_set_config(ESP_IF_WIFI_STA, &wifi_sta_config));
 
-    // Configure and start Access Point mode
     wifi_config_t wifi_ap_config = {
         .ap = {
             .ssid = AP_SSID,
             .password = AP_PASSWORD,
             .channel = 1,
             .authmode = WIFI_AUTH_WPA2_PSK,
-            .max_connection = 4,
+            .max_connection = MAX_DEVICES,
             .beacon_interval = 100,
         }
     };
@@ -138,10 +194,8 @@ void wifi_init(void) {
 void app_main(void) {
     ESP_LOGI(TAG, "Starting application");
 
-    // Initialize Wi-Fi in AP+STA mode
     wifi_init();
-
-    // Start HTTP server for OTA updates
+    discover_connected_devices();
     start_http_server();
 
     ESP_LOGI(TAG, "HTTP server running");
